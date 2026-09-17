@@ -202,7 +202,10 @@ The promoted set was cross-checked against a public UShER global tree.
 
 ## Licensing / data
 
+The code is released under the **MIT License** — see [`LICENSE`](LICENSE).
+
 This repository is **code only** — no sequences, alignments, promoted subsets,
 per-record tables, or model weights are committed, and the `.gitignore` blocks
-those file types as a guardrail. If you point the trigger at your own data,
-mind whatever license or data-use agreement governs it.
+those file types as a guardrail. The MIT license covers this code; it does
+**not** cover any data you run it on. If you point the sieve at your own data,
+mind whatever license or data-use agreement governs that data.
