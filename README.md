@@ -1,6 +1,10 @@
 # kmer-diversity-sieve
 
-[![CI](https://github.com/stevenweaver/kmer-diversity-sieve/actions/workflows/ci.yml/badge.svg)](https://github.com/stevenweaver/kmer-diversity-sieve/actions/workflows/ci.yml)
+[![CI](https://github.com/stevenweaver/kmer-diversity-sieve/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stevenweaver/kmer-diversity-sieve/actions/workflows/ci.yml)
+[![platforms: Linux · macOS](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS-informational)](https://github.com/stevenweaver/kmer-diversity-sieve/actions/workflows/ci.yml)
+[![backends: serial · pthreads · MPI](https://img.shields.io/badge/backends-serial%20%C2%B7%20pthreads%20%C2%B7%20MPI-blue)](#build-variants)
+[![deps: C compiler only](https://img.shields.io/badge/deps-C%20compiler%20only-brightgreen)](#build--run)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 An **alignment-free, streaming k-mer sieve** for archive-scale FASTA. In a
 single **C + OpenMPI** pass it reduces tens of millions of nucleotide sequences
