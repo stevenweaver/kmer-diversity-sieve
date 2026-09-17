@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install MPI toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
+
+      - name: Build l1_pipeline
+        run: |
+          mpicc -O3 -march=native -D_FILE_OFFSET_BITS=64 -Wall \
+            -o l1_pipeline scripts/l1_pipeline.c -lm
+
+      - name: Generate a tiny synthetic FASTA
+        # No data is committed to the repo; the smoke test builds its own input.
+        # ~200 short random-ish records with a handful of exact duplicates so the
+        # novelty stage has something to collapse.
+        run: |
+          python3 - <<'PY'
+          import random
+          random.seed(1)
+          base = "".join(random.choice("ACGT") for _ in range(300))
+          recs = []
+          for i in range(200):
+              # mutate the base a little for most, duplicate it exactly for some
+              if i % 20 == 0:
+                  s = base                      # exact duplicate -> should be collapsed
+              else:
+                  s = list(base)
+                  for _ in range(random.randint(1, 15)):
+                      p = random.randrange(len(s))
+                      s[p] = random.choice("ACGT")
+                  s = "".join(s)
+              recs.append(f">rec{i}|2021-0{i%9+1}-15\n{s}\n")
+          open("smoke.fasta", "w").write("".join(recs))
+          print("wrote smoke.fasta with", len(recs), "records")
+          PY
+
+      - name: Smoke test (single rank)
+        # Short records, so drop min-len to 200 and relax N-fraction.
+        run: |
+          mpirun --allow-run-as-root -np 1 ./l1_pipeline \
+            --input smoke.fasta --min-len 200 --max-n-frac 0.5 \
+            --warmup 50 --emit-promoted out
+          echo "--- promoted records ---"
+          cat out.rank*.fasta > promoted.fasta || true
+          n=$(grep -c '^>' promoted.fasta || echo 0)
+          echo "promoted: $n"
+          test "$n" -ge 1
+
+      - name: Multi-rank run (report rank-count drift, informational)
+        # The property the trigger guarantees is coverage-invariance across rank
+        # counts; the exact promoted *count* drifts at cluster margins (see
+        # l1_novelty.c). On a tiny synthetic set that drift is a large fraction
+        # of a small count, so we report it rather than gate on it — the hard
+        # assertions above (build + a sane smoke promotion) are the real gate.
+        run: |
+          # hosted runners expose few MPI slots; oversubscribe to force 2 ranks
+          mpirun --allow-run-as-root --oversubscribe -np 2 ./l1_pipeline \
+            --input smoke.fasta --min-len 200 --max-n-frac 0.5 \
+            --warmup 50 --emit-promoted out2
+          cat out2.rank*.fasta > promoted2.fasta
+          n1=$(grep -c '^>' promoted.fasta)
+          n2=$(grep -c '^>' promoted2.fasta)
+          d=$(( n1 > n2 ? n1 - n2 : n2 - n1 ))
+          echo "promoted: np1=$n1  np2=$n2  (margin drift: $d)"
+          # sanity only: 2 ranks must still promote a non-trivial subset
+          test "$n2" -ge 1

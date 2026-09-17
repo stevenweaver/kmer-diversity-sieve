@@ -1,0 +1,50 @@
+# ==========================================================================
+# GISAID DAA GUARDRAIL — never commit sequence data or per-sequence derived
+# files. Input sequences are DAA-restricted: no redistribution, no public
+# display. Only aggregate site-level results are publishable, and even those
+# are not committed here (this repo is CODE ONLY).
+# ==========================================================================
+*.fasta
+*.fas
+*.fa
+*.fastq
+*.sam
+*.bam
+*.msa
+*.nwk
+*.tree
+*.pb
+*.pb.gz
+*_dates.tsv
+*_taxa.csv
+promoted*.tsv
+*.rank*.fasta
+*.rank*
+
+# Model weights (belong to the hyphaeon repo — run, never redistributed here)
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Third-party manuscripts / private docs
+*.pdf
+
+# Compiled binaries (rebuild from source: `mpicc -O3 -march=native ...`)
+l1_pipeline
+l1_novelty
+l1_trigger
+l1_pipeline_datehash
+*.o
+*.out
+*.exe
+
+# Bulky reference downloads
+*.gz
+*.tar.xz
+*.metadata.tsv
+
+# Scratch / caches
+__pycache__/
+*.pyc
+.DS_Store
