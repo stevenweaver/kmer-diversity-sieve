@@ -137,8 +137,6 @@ which byte-range of the input and how the per-shard promoted sets are merged.*
 | `--k` | 15 | k-mer size |
 | `--sketch` | 64 | MinHash sketch size (m); LSH = 16 bands × (m/16) rows |
 | `--threshold` | 0.15 | novelty promotion threshold (τ) |
-| `--err-rate` | 1e-4 | admission Count-Min error rate |
-| `--p` | 0.9 | admission binomial cutoff p |
 | `--outlier-sd` | 5.0 | admission singleton-outlier SD threshold |
 | `--warmup` | 2000 | records to warm the Count-Min sketch before deciding |
 | `--limit` | 0 (all) | cap records (smoke tests) |

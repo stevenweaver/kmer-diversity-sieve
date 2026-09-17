@@ -8,8 +8,9 @@
  *
  * Per genome (streaming, byte-range sharded across shards -- MPI ranks OR pthreads):
  *   1. extract distinct canonical k-mers ONCE
- *   2. ADMISSION (compressor-2 port): rare k-mer = CMS df <= binomial_cutoff(N,err,p);
- *      singleton = df==0; REJECT if singleton-count is an outlier (> mean+SD*outlier_sd).
+ *   2. ADMISSION (compressor-2 port): singleton = k-mer unseen so far (CMS df==0);
+ *      REJECT if a genome's singleton-count is a statistical outlier (> mean+SD*outlier_sd
+ *      over the running per-shard distribution).
  *      -> rejected genomes (error-laden) STOP here, never reach novelty or L2.
  *   3. NOVELTY (admitted only): MinHash sketch from the SAME k-mers; promote if tau-distant
  *      from the shard-local promoted set (LSH band index, ~O(1) nn-search).
@@ -69,8 +70,6 @@ static inline double L1_WTIME(void){ struct timespec ts; clock_gettime(CLOCK_MON
 
 /* ---- admission config (match l1_trigger.c / oracle) ---- */
 #define DEF_K            15
-#define DEF_ERR_RATE     1e-4
-#define DEF_P            0.9
 #define DEF_OUTLIER_SD   5.0
 #define DEF_WARMUP       2000
 #define CMS_LOG2W        22   /* 2^22 x 4 rows x 4B = 64 MB/shard (was 2^24=256MB; caused node OOM at 128 ranks/node) */
@@ -105,11 +104,6 @@ static inline uint32_t cms_query(const cms_t*c,uint64_t key){ uint32_t m=UINT32_
     for(int r=0;r<CMS_D;r++){uint64_t col=mix64(key,CMS_SEEDS[r])&c->mask;uint32_t v=c->t[(uint64_t)r*c->W+col];if(v<m)m=v;} return m; }
 static inline void cms_inc(cms_t*c,uint64_t key){
     for(int r=0;r<CMS_D;r++){uint64_t col=mix64(key,CMS_SEEDS[r])&c->mask;c->t[(uint64_t)r*c->W+col]++;} }
-
-static long binomial_cutoff(long N,double p,double t){
-    if(N<=0)return 0; double s=0.0,term=pow(1.0-p,(double)N); long i=0;
-    while(s<t && i<N){ s+=term; double d=(1.0-p)*(double)(i+1); if(d==0.0)break;
-        term=term*p/(1.0-p)*(double)(N-i)/(double)(i+1); i++; } return i; }
 
 /* distinct canonical k-mers -> out[], returns distinct count (sorted+uniq'd) */
 static int cmp_u64(const void*a,const void*b){uint64_t x=*(const uint64_t*)a,y=*(const uint64_t*)b;return(x>y)-(x<y);}
@@ -173,6 +167,17 @@ static void pset_add(pset_t*p,int mbucket,const uint64_t*sk,int R,int B,const ch
     p->hdrs[p->n]= hdr?strdup(hdr):NULL;
     for(int band=0;band<B;band++) bucket_add(p,band_key(mbucket,band,sk,R),p->n); p->n++;
 }
+/* release everything pset_init/pset_add allocated: sketches, strdup'd headers, and the
+ * LSH bucket index (each bucket's id list + the bucket array itself). */
+static void pset_free(pset_t*p){
+    if(!p) return;
+    for(int i=0;i<p->n;i++) free(p->hdrs[i]);
+    free(p->hdrs); p->hdrs=NULL;
+    free(p->sk); p->sk=NULL;
+    for(uint64_t b=0;b<p->nbuk;b++) free(p->buk[b].ids);
+    free(p->buk); p->buk=NULL;
+    p->n=p->cap=0;
+}
 /* parse month bucket (year*12+month0) from a GISAID header: field 2 of '|' split = YYYY-MM-DD.
  * returns -1 if undated/unparseable (all such genomes share one bucket). */
 static int month_bucket(const char*hdr){
@@ -233,7 +238,7 @@ typedef struct {
     /* in */
     const char*input; off_t fsize; int tid, nshard;
     int k,m,B,R,warmup; long limit,min_len;
-    double err_rate,pcut,outlier_sd,max_n_frac,threshold;
+    double outlier_sd,max_n_frac,threshold;
     const uint64_t*salts;
     /* out */
     pset_t ps; long n_mine,n_admit,n_reject,n_skip,n_lowqual; double dt; off_t ms,me;
@@ -325,7 +330,7 @@ int main(int argc,char**argv){
     init_lut();
     const char*input=NULL,*emit=NULL; int k=DEF_K,m=DEF_M,warmup=DEF_WARMUP; long limit=0;
     long min_len=27000; double max_n_frac=0.05;   /* completeness gate (§2.22): drop partial/gappy */
-    double err_rate=DEF_ERR_RATE,pcut=DEF_P,outlier_sd=DEF_OUTLIER_SD,threshold=DEF_THRESHOLD;
+    double outlier_sd=DEF_OUTLIER_SD,threshold=DEF_THRESHOLD;
     int nthreads=1;
 #if defined(USE_THREADS)
     nthreads=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthreads<1)nthreads=1;   /* default = online CPUs */
@@ -336,8 +341,6 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[a],"--k"))k=atoi(argv[++a]);
         else if(!strcmp(argv[a],"--sketch"))m=atoi(argv[++a]);
         else if(!strcmp(argv[a],"--threshold"))threshold=atof(argv[++a]);
-        else if(!strcmp(argv[a],"--err-rate"))err_rate=atof(argv[++a]);
-        else if(!strcmp(argv[a],"--p"))pcut=atof(argv[++a]);
         else if(!strcmp(argv[a],"--outlier-sd"))outlier_sd=atof(argv[++a]);
         else if(!strcmp(argv[a],"--warmup"))warmup=atoi(argv[++a]);
         else if(!strcmp(argv[a],"--limit"))limit=atol(argv[++a]);
@@ -416,6 +419,8 @@ int main(int argc,char**argv){
     for(int i=0;i<local_p;i++){ if(ps.hdrs[i]){ strncpy(&myhdr[(size_t)i*HW],ps.hdrs[i],HW-1); } }
     MPI_Gatherv(ps.sk,local_p*m,MPI_UINT64_T,allsk,rc,rd,MPI_UINT64_T,0,MPI_COMM_WORLD);
     MPI_Gatherv(myhdr,local_p*HW,MPI_CHAR,allhdr,hc,hd,MPI_CHAR,0,MPI_COMM_WORLD);
+    free(myhdr);
+    if(rank==0){ free(counts); free(rc); free(rd); free(hc); free(hd); }
 
     MPI_Reduce(&n_mine,&g_mine,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
     MPI_Reduce(&n_admit,&g_admit,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
@@ -436,7 +441,7 @@ int main(int argc,char**argv){
     for(int t=0;t<nthreads;t++){ shard_t*S=&sh[t];
         S->input=input; S->fsize=fsize; S->tid=t; S->nshard=nthreads;
         S->k=k; S->m=m; S->B=B; S->R=R; S->warmup=warmup; S->limit=limit; S->min_len=min_len;
-        S->err_rate=err_rate; S->pcut=pcut; S->outlier_sd=outlier_sd; S->max_n_frac=max_n_frac;
+        S->outlier_sd=outlier_sd; S->max_n_frac=max_n_frac;
         S->threshold=threshold; S->salts=salts;
         pthread_create(&th[t],NULL,shard_thread,S); }
     for(int t=0;t<nthreads;t++) pthread_join(th[t],NULL);
@@ -465,7 +470,7 @@ int main(int argc,char**argv){
     shard_t S; memset(&S,0,sizeof S);
     S.input=input; S.fsize=fsize; S.tid=0; S.nshard=1;
     S.k=k; S.m=m; S.B=B; S.R=R; S.warmup=warmup; S.limit=limit; S.min_len=min_len;
-    S.err_rate=err_rate; S.pcut=pcut; S.outlier_sd=outlier_sd; S.max_n_frac=max_n_frac;
+    S.outlier_sd=outlier_sd; S.max_n_frac=max_n_frac;
     S.threshold=threshold; S.salts=salts;
     run_shard(&S);
     pset_t ps=S.ps; ms=S.ms; me=S.me;
@@ -493,6 +498,7 @@ int main(int argc,char**argv){
             int mb=month_bucket(&allhdr[(size_t)i*HW]);
             if(is_novel(&merged,mb,msk,threshold,R,B)){ pset_add(&merged,mb,msk,R,B,NULL);
                 memcpy(&promoted_hdrs[(size_t)n_promoted*HW],&allhdr[(size_t)i*HW],HW); n_promoted++; } }
+        pset_free(&merged);   /* survivor headers already copied into promoted_hdrs */
 #else
         /* SERIAL phase-2 NO-OP: the streaming pset already applied month-partitioned novelty,
          * so it IS the global promoted set. Do NOT re-run the merge (would double-apply). */
@@ -517,12 +523,13 @@ int main(int argc,char**argv){
      * halves peak memory during emit (matters at scale — this class of over-allocation OOM'd nodes). */
 #ifdef USE_MPI
     free(cms.t); cms.t=NULL;
-    free(ps.sk); free(kbuf); free(sk);
+    pset_free(&ps); free(kbuf); free(sk);
+    if(rank==0){ free(allsk); free(allhdr); }   /* gather buffers (rank0-only) */
 #elif defined(USE_THREADS)
-    for(int t=0;t<nthreads;t++) free(sh[t].ps.sk);
+    for(int t=0;t<nthreads;t++) pset_free(&sh[t].ps);
     free(allsk); free(allhdr);
 #else
-    free(ps.sk); free(allsk); free(allhdr);
+    pset_free(&ps); free(allsk); free(allhdr);
 #endif
 
     /* ---- EMIT: re-scan each shard's byte range + write owned promoted genomes ---- */
@@ -582,6 +589,7 @@ int main(int argc,char**argv){
     free(promoted_hdrs);
 #endif
 
+    free((void*)salts);
     L1_FINALIZE();
     return 0;
 }
