@@ -9,6 +9,117 @@ on:
 jobs:
   build-and-smoke:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SERIAL: drift-free reference oracle. cc -O3, no MPI, one process reads
+          # the whole file. No apt install -> fastest lane.
+          # single_process => the frequency filter sees the whole file, so we can
+          # assert it fires (removes >=1 outlier).
+          - backend: serial
+            needs_mpi: false
+            single_process: true
+            cc: cc
+            cflags: "-O3 -march=native -D_FILE_OFFSET_BITS=64 -Wall"
+            run: "./l1_pipeline"
+          # THREADS: cc -pthread, N pthreads each own a byte-range, in-process merge.
+          # No apt install (no OpenMP, no MPI) -> fastest lane. Multi-shard: the
+          # filter's per-shard statistics differ, so we don't assert its count.
+          - backend: threads
+            needs_mpi: false
+            single_process: false
+            cc: cc
+            cflags: "-O3 -march=native -pthread -DUSE_THREADS -D_FILE_OFFSET_BITS=64 -Wall"
+            run: "./l1_pipeline --threads 2"
+          # MPI: current behavior, unchanged. Keeps the libopenmpi-dev install.
+          # Run at -np 1 here => single_process, so the filter assertion applies.
+          - backend: mpi
+            needs_mpi: true
+            single_process: true
+            cc: mpicc
+            cflags: "-O3 -march=native -DUSE_MPI -D_FILE_OFFSET_BITS=64 -Wall"
+            run: "mpirun --allow-run-as-root -np 1 ./l1_pipeline"
+
+    name: build-and-smoke (${{ matrix.backend }})
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install MPI toolchain
+        if: ${{ matrix.needs_mpi }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
+
+      - name: Build l1_pipeline (${{ matrix.backend }})
+        run: |
+          ${{ matrix.cc }} ${{ matrix.cflags }} \
+            -o l1_pipeline scripts/l1_pipeline.c -lm
+
+      - name: Generate a tiny synthetic FASTA
+        # No data is committed to the repo; the smoke test builds its own input.
+        # 600 records from one base string (so the near-duplicate collapse stage
+        # has something to collapse), PLUS ~15 fully-independent random strings so
+        # the frequency filter has clear outliers to remove. The size + warmup are
+        # tuned so the filter's outlier statistics stabilize and it actually fires
+        # on a single-process pass -- otherwise the stage sits idle and the smoke
+        # test can't tell whether it works.
+        run: |
+          python3 - <<'PY'
+          import random
+          random.seed(1)
+          base = "".join(random.choice("ACGT") for _ in range(600))
+          recs = []
+          for i in range(600):
+              if i % 40 == 0:
+                  s = "".join(random.choice("ACGT") for _ in range(600))  # outlier
+              elif i % 20 == 0:
+                  s = base                                                # duplicate
+              else:
+                  s = list(base)
+                  for _ in range(random.randint(1, 25)):
+                      p = random.randrange(len(s))
+                      s[p] = random.choice("ACGT")
+                  s = "".join(s)
+              recs.append(f">rec{i}|2021-{(i % 12) + 1:02d}-15\n{s}\n")
+          open("smoke.fasta", "w").write("".join(recs))
+          print("wrote smoke.fasta with", len(recs), "records")
+          PY
+
+      - name: Smoke test (${{ matrix.backend }})
+        # Short records, so drop min-len to 200 and relax N-fraction.
+        # We parse the run's own summary counters rather than only counting the
+        # emitted subset, so we can assert BOTH stages did something.
+        #
+        # Note on the frequency filter: it flags a record whose novel-substring
+        # count is a statistical outlier relative to what its shard has seen so
+        # far. That is inherently shard-count dependent -- each shard keeps its
+        # own running statistics -- so we only require it to fire on the
+        # single-process lanes (serial, and mpi at -np 1), where the stats see
+        # the whole file. Multi-shard lanes just assert the subset is non-empty.
+        run: |
+          ${{ matrix.run }} \
+            --input smoke.fasta --min-len 200 --max-n-frac 0.5 \
+            --warmup 200 --emit-promoted out | tee run.log
+          echo "--- promoted subset (${{ matrix.backend }}) ---"
+          cat out.rank*.fasta > promoted.fasta || true
+          n=$(grep -c '^>' promoted.fasta || echo 0)
+          echo "promoted subset size: $n"
+          test "$n" -ge 1
+          # single-process lanes must show the frequency filter removing >=1 outlier
+          if [ "${{ matrix.single_process }}" = "true" ]; then
+            removed=$(grep -Eo 'REJECT \(error\)[[:space:]]*:[[:space:]]*[0-9]+' run.log | grep -Eo '[0-9]+$' || echo 0)
+            echo "frequency filter removed (single-process): $removed"
+            test "${removed:-0}" -ge 1
+          fi
+
+  # Extra MPI-only check: coverage-invariance across rank counts. The exact
+  # promoted *count* drifts at cluster margins (see l1_novelty.c); on a tiny
+  # synthetic set that drift is a large fraction of a small count, so this is
+  # reported, not gated. The hard build + smoke assertions above are the real
+  # gate. Kept as a separate job so it does not slow the serial/threads lanes.
+  mpi-multirank-drift:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -17,15 +128,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
 
-      - name: Build l1_pipeline
+      - name: Build l1_pipeline (mpi)
         run: |
-          mpicc -O3 -march=native -D_FILE_OFFSET_BITS=64 -Wall \
+          mpicc -O3 -march=native -DUSE_MPI -D_FILE_OFFSET_BITS=64 -Wall \
             -o l1_pipeline scripts/l1_pipeline.c -lm
 
       - name: Generate a tiny synthetic FASTA
-        # No data is committed to the repo; the smoke test builds its own input.
-        # ~200 short random-ish records with a handful of exact duplicates so the
-        # novelty stage has something to collapse.
         run: |
           python3 - <<'PY'
           import random
@@ -33,9 +141,8 @@ jobs:
           base = "".join(random.choice("ACGT") for _ in range(300))
           recs = []
           for i in range(200):
-              # mutate the base a little for most, duplicate it exactly for some
               if i % 20 == 0:
-                  s = base                      # exact duplicate -> should be collapsed
+                  s = base
               else:
                   s = list(base)
                   for _ in range(random.randint(1, 15)):
@@ -47,24 +154,19 @@ jobs:
           print("wrote smoke.fasta with", len(recs), "records")
           PY
 
-      - name: Smoke test (single rank)
-        # Short records, so drop min-len to 200 and relax N-fraction.
+      - name: Single-rank baseline
         run: |
           mpirun --allow-run-as-root -np 1 ./l1_pipeline \
             --input smoke.fasta --min-len 200 --max-n-frac 0.5 \
             --warmup 50 --emit-promoted out
-          echo "--- promoted records ---"
-          cat out.rank*.fasta > promoted.fasta || true
-          n=$(grep -c '^>' promoted.fasta || echo 0)
-          echo "promoted: $n"
-          test "$n" -ge 1
+          cat out.rank*.fasta > promoted.fasta
+          test "$(grep -c '^>' promoted.fasta)" -ge 1
 
       - name: Multi-rank run (report rank-count drift, informational)
         # The property the trigger guarantees is coverage-invariance across rank
         # counts; the exact promoted *count* drifts at cluster margins (see
         # l1_novelty.c). On a tiny synthetic set that drift is a large fraction
-        # of a small count, so we report it rather than gate on it — the hard
-        # assertions above (build + a sane smoke promotion) are the real gate.
+        # of a small count, so we report it rather than gate on it.
         run: |
           # hosted runners expose few MPI slots; oversubscribe to force 2 ranks
           mpirun --allow-run-as-root --oversubscribe -np 2 ./l1_pipeline \

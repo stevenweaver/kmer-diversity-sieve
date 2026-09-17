@@ -30,8 +30,10 @@ promoted*.tsv
 # Third-party manuscripts / private docs
 *.pdf
 
-# Compiled binaries (rebuild from source: `mpicc -O3 -march=native ...`)
+# Compiled binaries (rebuild from source: `make serial|threads|mpi`)
 l1_pipeline
+l1_pipeline_serial
+l1_pipeline_threads
 l1_novelty
 l1_trigger
 l1_pipeline_datehash
