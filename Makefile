@@ -32,7 +32,7 @@ BIN_SERIAL  := l1_pipeline_serial
 BIN_THREADS := l1_pipeline_threads
 BIN_MPI     := l1_pipeline
 
-.PHONY: all serial threads mpi clean
+.PHONY: all serial threads mpi test unit e2e clean
 .DEFAULT_GOAL := serial
 
 serial: $(BIN_SERIAL)
@@ -49,5 +49,21 @@ $(BIN_MPI): $(SRC)
 
 all: serial threads mpi
 
+# ---- tests ----
+#   make unit  -> C unit tests for the pure primitives (no MPI/threads needed)
+#   make e2e   -> end-to-end + backend-invariant tests (mpi lane auto-skipped if absent)
+#   make test  -> both
+TEST_CFLAGS := -O2 $(ARCHFLAG) -D_FILE_OFFSET_BITS=64 -Wall -Wno-misleading-indentation
+
+unit: unit_test
+unit_test: tests/unit_test.c $(SRC)
+	$(CC) $(TEST_CFLAGS) -DL1_NO_MAIN -Iscripts -o $@ tests/unit_test.c $(LDLIBS)
+	./unit_test
+
+e2e:
+	bash tests/e2e.sh
+
+test: unit e2e
+
 clean:
-	rm -f $(BIN_SERIAL) $(BIN_THREADS) $(BIN_MPI)
+	rm -f $(BIN_SERIAL) $(BIN_THREADS) $(BIN_MPI) unit_test

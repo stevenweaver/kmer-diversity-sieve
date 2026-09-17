@@ -317,6 +317,9 @@ static void*emit_thread(void*a){ emit_arg_t*e=(emit_arg_t*)a;
     emit_shard(e->input,e->ms,e->me,e->idx,e->emit,e->promoted_hdrs,e->n_promoted); return NULL; }
 #endif
 
+/* Define L1_NO_MAIN to compile this file as a library of static primitives for unit tests
+ * (tests/unit_test.c does `#include "l1_pipeline.c"` and provides its own main). */
+#ifndef L1_NO_MAIN
 int main(int argc,char**argv){
 #ifdef USE_MPI
     MPI_Init(&argc,&argv);
@@ -593,3 +596,4 @@ int main(int argc,char**argv){
     L1_FINALIZE();
     return 0;
 }
+#endif /* L1_NO_MAIN */
