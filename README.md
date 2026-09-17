@@ -66,19 +66,65 @@ rank count.
 
 ## Build & run
 
-Requires an MPI toolchain (`mpicc`, `mpirun` — OpenMPI or MPICH) and a C99
-compiler with a math library.
+The pipeline is a **single C source** (`scripts/l1_pipeline.c`) that builds into
+**three interchangeable backends**, chosen at compile time. Only the **mpi**
+backend needs an MPI toolchain; **serial** and **threads** compile with nothing
+but a stock C compiler (`cc` — clang or gcc) and a math library.
 
 ```sh
-mpicc -O3 -march=native -D_FILE_OFFSET_BITS=64 -o l1_pipeline scripts/l1_pipeline.c -lm
+make serial    # cc -O3, no MPI, no threads     -> l1_pipeline_serial
+make threads   # cc -pthread (NO OpenMP)         -> l1_pipeline_threads
+make mpi       # mpicc -DUSE_MPI                 -> l1_pipeline
+make all       # build all three
+```
+
+Then run whichever you built:
+
+```sh
+./l1_pipeline_serial  --input FILE.fasta [--emit-promoted PREFIX] [opts]
+./l1_pipeline_threads --input FILE.fasta --threads N [--emit-promoted PREFIX] [opts]
 mpirun -np N ./l1_pipeline --input FILE.fasta [--emit-promoted PREFIX] [opts]
 ```
 
-Smoke test (single rank, capped input):
+Smoke test (serial, capped input — zero dependencies):
 
 ```sh
-./l1_pipeline --input FILE.fasta --limit 5000
+./l1_pipeline_serial --input FILE.fasta --limit 5000
 ```
+
+### Build variants
+
+One source, one algorithm, three ways to shard the input file. **The admission
+and novelty math is identical in all three** — they differ only in *who owns
+which byte-range of the input and how the per-shard promoted sets are merged.*
+
+| Backend | Build | Parallelism | When to use |
+|---|---|---|---|
+| **serial** | `make serial` (`cc -O3`, no MPI/threads) | none — one process reads the whole file | **zero dependencies**; laptop, CI, smoke tests. The **drift-free reference oracle** (see below). |
+| **threads** | `make threads` (`cc -pthread`, **no OpenMP**) | `--threads N` pthreads, each owns a byte-range, merged in-process | **one big multi-core box.** Only needs `-pthread` — no MPI toolchain. |
+| **mpi** | `make mpi` (`mpicc -DUSE_MPI`) | `mpirun -np N` ranks, byte-range sharded, MPI-gathered merge | **multi-node cluster.** Scale across nodes (see the case study). |
+
+- **serial is the drift-free reference.** It uses **one** shard = the whole file
+  in genome order: a single Count-Min sketch and a single warm-up ramp that
+  every record contributes to, so the phase-2 cross-shard merge is a genuine
+  **no-op** — there is no cross-shard boundary and therefore **zero merge
+  drift**. Use it to define ground-truth admit/reject/promote decisions.
+- **threads** gives each pthread its own Count-Min sketch + promoted set +
+  warm-up stats over its own byte-range (**no shared/atomic state** — sharing one
+  sketch would change the numerics), then runs the **same** greedy,
+  partition-aware phase-2 merge the MPI rank-0 does. With `N` threads it
+  reproduces `mpirun -np N` **bit-for-bit** on the same input.
+- `--threads N` selects the thread count for the **threads** backend and
+  defaults to the number of online CPUs (`sysconf(_SC_NPROCESSORS_ONLN)`). It is
+  accepted-and-ignored by the serial and mpi backends (which take their width
+  from the process count / `-np`).
+- **mpi** is the original backend and is **unchanged** — same byte-range
+  sharding, same two-phase gather-and-merge, same output filenames.
+
+> **Arch note.** `-march=native` is x86-only; clang on Apple Silicon rejects it.
+> The `Makefile` detects the architecture and uses `-mcpu=native` on
+> `arm64`/`aarch64` instead. If you build by hand on Apple Silicon, use plain
+> `-O3` (or `-mcpu=native`) rather than `-march=native`.
 
 ## CLI reference
 
@@ -96,36 +142,53 @@ Smoke test (single rank, capped input):
 | `--outlier-sd` | 5.0 | admission singleton-outlier SD threshold |
 | `--warmup` | 2000 | records to warm the Count-Min sketch before deciding |
 | `--limit` | 0 (all) | cap records (smoke tests) |
+| `--threads` | online CPUs | **threads backend only:** number of pthreads (each owns a byte-range) |
 
 The `27000` / `0.05` defaults are sized for coronavirus-length genomes —
 **override `--min-len` and `--max-n-frac` for any other organism.**
 
 ## Running on a single node — read this first
 
-The single biggest lesson from building this: **at archive scale you are
-bound by how fast one file can be read, not by CPU.** Each MPI rank `fseek`s to
-its own contiguous byte-range of the input and streams from there, so all ranks
-hammer the *same* file on the *same* storage.
+**On a single node, prefer the `threads` backend over `mpirun` on localhost.**
+Both shard the same file the same way and produce identical decisions, but the
+threaded build needs only `-pthread` (no MPI toolchain, no launcher, no per-rank
+process overhead), shares one address space, and is the simpler thing to reason
+about on one box:
 
-- **Admission throughput scales to ~16–32 ranks per node, then plateaus** —
+```sh
+make threads
+./l1_pipeline_threads --input FILE.fasta --threads 16 [--emit-promoted PREFIX]
+```
+
+Reserve **mpi** for when you are actually spanning **multiple nodes** — that is
+the only regime where `mpirun` earns its overhead.
+
+The single biggest lesson from building this: **at archive scale you are
+bound by how fast one file can be read, not by CPU.** Each shard (pthread or MPI
+rank) `fseek`s to its own contiguous byte-range of the input and streams from
+there, so all shards hammer the *same* file on the *same* storage.
+
+- **Admission throughput scales to ~16–32 shards per node, then plateaus** —
   that plateau is the shared single-file read bandwidth, not a CPU limit.
-  Adding more ranks *on the same node* buys nothing past that point and can
-  make things worse (I/O contention + memory).
-- **Go wider with more *nodes*, not more ranks per node.** Novelty (the
+  Adding more shards *on the same node* (more `--threads`, or more ranks) buys
+  nothing past that point and can make things worse (I/O contention + memory).
+- **Go wider with more *nodes*, not more shards per node.** Novelty (the
   compute-bound stage) scales near-linearly; ingestion does not. On one node,
   expect to saturate at that per-node plateau — a single node is fine for
-  millions of records, but do not expect linear speedup from `-np 128` on one
-  box.
-- **Memory:** the Count-Min sketch is **64 MB/rank**. At 128 ranks/node that is
-  ~8 GB just for sketches — an earlier 256 MB/rank sketch OOM-killed nodes at
-  high rank counts. Size your `ranks × 64 MB` against node RAM.
+  millions of records, but do not expect linear speedup from `--threads 128`
+  (or `-np 128`) on one box.
+- **Memory:** the Count-Min sketch is **64 MB/shard**. At 128 shards/node that is
+  ~8 GB just for sketches — an earlier 256 MB/shard sketch OOM-killed nodes at
+  high shard counts. Size your `shards × 64 MB` against node RAM.
 - **Fastest storage wins.** Put the input on the fastest local/parallel
   filesystem you have; a single file on slow shared storage is the worst case.
-- With `-np 1` there is no parallelism at all — one rank reads the whole file
-  sequentially. That is the right mode only for smoke tests (`--limit`).
+- **One shard = no parallelism.** `./l1_pipeline_serial` (or `--threads 1`, or
+  `-np 1`) reads the whole file sequentially. Serial is the right mode for smoke
+  tests (`--limit`) and as the drift-free reference oracle.
 
-Rule of thumb: `mpirun -np <16–32 per node> --bind-to core`, scaled out across
-as many nodes as you can give it.
+Rule of thumb on one box: `./l1_pipeline_threads --threads <16–32>`. To go
+bigger, `mpirun -np <16–32 per node> --bind-to core` scaled out across as many
+nodes as you can give it.
 
 ## Output & the L2 layer
 

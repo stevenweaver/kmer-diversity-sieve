@@ -1,19 +1,19 @@
 /*
- * l1_pipeline.c -- COMPOSED L1 DAQ trigger (C + OpenMPI): admission + novelty, ONE pass.
+ * l1_pipeline.c -- COMPOSED L1 DAQ trigger (C): admission + novelty, ONE pass.
  *
  * Fuses the two validated stages (l1_trigger.c admission, l1_novelty.c novelty) into a
  * single streaming pass. Efficiency: k-mers are extracted ONCE per genome and reused for
  * BOTH the Count-Min frequency check (admission) and the MinHash sketch (novelty) — no
  * double file read, no double k-mer parse.
  *
- * Per genome (streaming, byte-range sharded across MPI ranks):
+ * Per genome (streaming, byte-range sharded across shards -- MPI ranks OR pthreads):
  *   1. extract distinct canonical k-mers ONCE
  *   2. ADMISSION (compressor-2 port): rare k-mer = CMS df <= binomial_cutoff(N,err,p);
  *      singleton = df==0; REJECT if singleton-count is an outlier (> mean+SD*outlier_sd).
  *      -> rejected genomes (error-laden) STOP here, never reach novelty or L2.
  *   3. NOVELTY (admitted only): MinHash sketch from the SAME k-mers; promote if tau-distant
  *      from the shard-local promoted set (LSH band index, ~O(1) nn-search).
- *   4. PHASE 2: Gatherv shard-local promoted sketches -> rank0 greedy merge -> global set.
+ *   4. PHASE 2: gather shard-local promoted sketches+headers -> greedy merge -> global set.
  *
  * Output: the global promoted set = the ~1.3% that goes to L2 reconstruction. Optionally
  * emit their headers (--emit-promoted) as the L2 input manifest.
@@ -21,10 +21,22 @@
  * Composition validated: admission exactly matches its oracle; novelty matches magnitude;
  * both scaling curves measured (admission 17.8x@64 file-bound, novelty 63.9x@64 linear).
  *
- * Build: mpicc -O3 -march=native -D_FILE_OFFSET_BITS=64 -o l1_pipeline l1_pipeline.c -lm
- * Run:   mpirun -np N ./l1_pipeline --input file.fasta [--emit-promoted out.txt] [opts]
+ * THREE BUILD BACKENDS from ONE source, chosen by a compile-time switch:
+ *   Build (MPI):     mpicc -O3 -march=native -DUSE_MPI -D_FILE_OFFSET_BITS=64 -o l1_pipeline l1_pipeline.c -lm
+ *   Build (threads): cc    -O3 -march=native -pthread -DUSE_THREADS -D_FILE_OFFSET_BITS=64 -o l1_pipeline l1_pipeline.c -lm
+ *   Build (serial):  cc    -O3 -march=native -D_FILE_OFFSET_BITS=64 -o l1_pipeline l1_pipeline.c -lm
+ *   NOTE: on Apple Silicon use -O3 or -mcpu=native (clang arm64 rejects -march=native); x86 -march=native is fine.
+ * SERIAL is the DRIFT-FREE reference oracle: one shard, one warmup ramp, one CMS over the
+ * whole file in genome order, so phase-2 is a genuine NO-OP (no cross-shard merge => no drift).
+ * THREADS with N threads reproduces MPI with N ranks bit-for-bit on admission (per-shard CMS,
+ * per-shard warmup, no shared/atomic state), then the SAME greedy month-partitioned merge.
+ *   Run (MPI):     mpirun -np N ./l1_pipeline --input file.fasta [--emit-promoted out] [opts]
+ *   Run (threads): ./l1_pipeline --input file.fasta --threads N [--emit-promoted out] [opts]
+ *   Run (serial):  ./l1_pipeline --input file.fasta [--emit-promoted out] [opts]
  */
+#ifdef USE_MPI
 #include <mpi.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +44,28 @@
 #include <math.h>
 #include <ctype.h>
 #include <sys/types.h>
+#ifndef USE_MPI
+#include <time.h>            /* clock_gettime for L1_WTIME in non-MPI builds */
+#endif
+#if defined(USE_THREADS)
+#include <pthread.h>         /* threads backend: cc -pthread, NO OpenMP */
+#include <unistd.h>          /* sysconf(_SC_NPROCESSORS_ONLN) for --threads default */
+#endif
+
+/* ---- backend shim (active in main()/worker only; the algorithm functions never call MPI) ----
+ * The MPI arm expands to the exact MPI_* call it always used (byte-identical); serial/threads
+ * expand to the local equivalent. Every MPI_* token lives only inside an `#ifdef USE_MPI` arm,
+ * so `mpicc -DUSE_MPI` produces byte-identical behavior to before this refactor. */
+#ifdef USE_MPI
+#define L1_ABORT()     MPI_Abort(MPI_COMM_WORLD,1)
+#define L1_FINALIZE()  MPI_Finalize()
+#define L1_WTIME()     MPI_Wtime()
+#else
+#define L1_ABORT()     abort()
+#define L1_FINALIZE()  ((void)0)
+static inline double L1_WTIME(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec*1e-9; }
+#endif
 
 /* ---- admission config (match l1_trigger.c / oracle) ---- */
 #define DEF_K            15
@@ -39,7 +73,7 @@
 #define DEF_P            0.9
 #define DEF_OUTLIER_SD   5.0
 #define DEF_WARMUP       2000
-#define CMS_LOG2W        22   /* 2^22 x 4 rows x 4B = 64 MB/rank (was 2^24=256MB; caused node OOM at 128 ranks/node) */
+#define CMS_LOG2W        22   /* 2^22 x 4 rows x 4B = 64 MB/shard (was 2^24=256MB; caused node OOM at 128 ranks/node) */
 #define CMS_D            4
 /* ---- novelty config (match l1_novelty.c) ---- */
 #define DEF_M            64
@@ -66,7 +100,7 @@ static inline uint64_t mix64(uint64_t x,uint64_t seed){
 typedef struct { uint32_t *t; uint64_t W,mask; } cms_t;
 static void cms_init(cms_t*c){ c->W=(uint64_t)1<<CMS_LOG2W; c->mask=c->W-1;
     c->t=calloc((size_t)CMS_D*c->W,sizeof(uint32_t));
-    if(!c->t){fprintf(stderr,"CMS alloc fail\n");MPI_Abort(MPI_COMM_WORLD,1);} }
+    if(!c->t){fprintf(stderr,"CMS alloc fail\n");L1_ABORT();} }
 static inline uint32_t cms_query(const cms_t*c,uint64_t key){ uint32_t m=UINT32_MAX;
     for(int r=0;r<CMS_D;r++){uint64_t col=mix64(key,CMS_SEEDS[r])&c->mask;uint32_t v=c->t[(uint64_t)r*c->W+col];if(v<m)m=v;} return m; }
 static inline void cms_inc(cms_t*c,uint64_t key){
@@ -150,13 +184,152 @@ static int month_bucket(const char*hdr){
     return y*12+(mo-1);
 }
 
+/* fixed-width header for the gathered/merged promoted set (bytes are backend-portable) */
+#define HW 256
+
+/* ---- streaming core, shared by every backend (file-scope macro so it can expand both in
+ * main() -- MPI/serial -- and inside the per-thread worker). It references cms, ps and the
+ * per-shard warmup stats (sc_sum/sc_sqsum/sc_n) as locals in whatever scope it is used, so
+ * admission always uses the PER-SHARD CMS and PER-SHARD warmup ramp (never shared, never
+ * atomic) -- this is what makes THREADS==MPI given the same partition. ---- */
+#define PIPE_PROCESS() do{ if(in_seq){ n_mine++; \
+    /* COMPLETENESS GATE (§2.22): drop partial/gappy genomes BEFORE novelty can promote them for \
+     * being k-mer-sparse. Cheap length + N-fraction check, before k-mer extraction. */ \
+    if((long)seqlen<min_len || n_fraction(seq,seqlen)>max_n_frac){ n_lowqual++; } else { \
+    size_t nu=genome_kmers(seq,seqlen,k,kbuf,kcap); \
+    if(nu==0){ n_skip++; } else { \
+        /* ADMISSION */ \
+        long n_singleton=0; for(size_t z=0;z<nu;z++){uint32_t d=cms_query(&cms,kbuf[z]);if(d==0)n_singleton++;} \
+        int reject=0; \
+        if(sc_n>=warmup && n_mine>warmup){ double mean=sc_sum/sc_n,var=sc_sqsum/sc_n-mean*mean; if(var<0)var=0; \
+            if((double)n_singleton>mean+outlier_sd*sqrt(var)+0.5) reject=1; } \
+        sc_sum+=n_singleton; sc_sqsum+=(double)n_singleton*n_singleton; sc_n++; \
+        if(reject){ n_reject++; } else { n_admit++; \
+            for(size_t z=0;z<nu;z++) cms_inc(&cms,kbuf[z]); \
+            /* NOVELTY on admitted only, reusing the SAME k-mers. Date-partitioned: \
+             * novelty judged within the sample's month bucket. */ \
+            minhash_from_kmers(kbuf,nu,m,salts,sk); \
+            int mb=month_bucket(hdr); \
+            if(is_novel(&ps,mb,sk,threshold,R,B)) pset_add(&ps,mb,sk,R,B,hdr); \
+        } } } \
+    if(limit && n_mine>=limit) stop=1; } }while(0)
+
+/* ---- emit: re-scan a byte range and re-write owned promoted genomes (never moves sequences).
+ * The membership test is a bsearch into the sorted global promoted_hdrs (read-only => safe to
+ * share across emit threads). Shared macro so MPI's inline emit and the non-MPI emit_shard()
+ * expand to the identical body. ---- */
+#define FLUSH_EMIT() do{ if(have){ char key[HW]; strncpy(key,curh,HW-1); key[HW-1]=0; \
+    if(bsearch(key,promoted_hdrs,n_promoted,HW,(int(*)(const void*,const void*))strcmp)){ \
+        fprintf(of,">%s\n",curh); fwrite(ebuf,1,ebl,of); fputc('\n',of); } } }while(0)
+
+#ifndef USE_MPI
+/* ---- per-shard worker (serial: one call over the whole file; threads: one call per pthread).
+ * Private CMS + private promoted pset + private warmup stats, streaming a byte range. This is
+ * numerically identical to one MPI rank over the same byte range: no shared/atomic state, so
+ * the CMS is never merged (it is a shard-local running frequency oracle) and the warmup ramp
+ * (sc_*) is per-shard by construction. Only the scalar tallies and the promoted sketches are
+ * ever combined afterward. ---- */
+typedef struct {
+    /* in */
+    const char*input; off_t fsize; int tid, nshard;
+    int k,m,B,R,warmup; long limit,min_len;
+    double err_rate,pcut,outlier_sd,max_n_frac,threshold;
+    const uint64_t*salts;
+    /* out */
+    pset_t ps; long n_mine,n_admit,n_reject,n_skip,n_lowqual; double dt; off_t ms,me;
+} shard_t;
+
+static void run_shard(shard_t*S){
+    int k=S->k,m=S->m,B=S->B,R=S->R,warmup=S->warmup; long limit=S->limit,min_len=S->min_len;
+    double outlier_sd=S->outlier_sd,max_n_frac=S->max_n_frac,threshold=S->threshold;
+    const uint64_t*salts=S->salts;
+    cms_t cms; cms_init(&cms);
+    pset_t ps; pset_init(&ps,m,20);
+    FILE*fp=fopen(S->input,"rb"); if(!fp){fprintf(stderr,"open fail\n");L1_ABORT();}
+    /* byte-range shard: SAME snap-to-'>' boundary logic as the MPI path, with tid/nshard in
+     * place of rank/nproc so a THREADS run reproduces MPI's partition (and thus its results)
+     * exactly. tid==0 starts at byte 0; every other shard skips to the next record start. */
+    off_t slice=S->fsize/S->nshard, ms=(off_t)S->tid*slice, me=(S->tid==S->nshard-1)?S->fsize:(off_t)(S->tid+1)*slice;
+    if(S->tid>0){ fseeko(fp,ms,SEEK_SET); int c; while((c=fgetc(fp))!=EOF&&c!='\n');
+        while(1){long here=ftello(fp);c=fgetc(fp);if(c==EOF){ms=here;break;}if(c=='>'){ms=here;break;}while((c=fgetc(fp))!=EOF&&c!='\n');} }
+    else ms=0;
+    fseeko(fp,ms,SEEK_SET);
+    S->ms=ms; S->me=me;   /* saved for the emit re-scan: emit MUST reuse this exact partition */
+
+    size_t seqcap=1<<20,hdrcap=1<<12,kcap=1<<16;
+    uint8_t*seq=malloc(seqcap); char*hdr=malloc(hdrcap); uint64_t*kbuf=malloc(kcap*sizeof(uint64_t));
+    uint64_t*sk=malloc(m*sizeof(uint64_t));
+    size_t seqlen=0; int in_seq=0; char*line=NULL; size_t lc=0; ssize_t ll;
+    long n_mine=0,n_admit=0,n_reject=0,n_skip=0,n_lowqual=0; double sc_sum=0,sc_sqsum=0; long sc_n=0;
+    double t0=L1_WTIME(); int stop=0;
+    while((ll=getline(&line,&lc,fp))>=0){
+        if(line[0]=='>'){ long hoff=ftello(fp)-ll; PIPE_PROCESS(); if(stop)break;
+            if(hoff>=me){in_seq=0;break;}
+            size_t L=ll; while(L>0&&(line[L-1]=='\n'||line[L-1]=='\r'))L--;
+            if(L>=hdrcap){hdrcap=L+1;hdr=realloc(hdr,hdrcap);} memcpy(hdr,line+1,L-1); hdr[L-1]=0;
+            seqlen=0; in_seq=1;
+        } else { size_t L=ll; while(L>0&&(line[L-1]=='\n'||line[L-1]=='\r'))L--;
+            if(seqlen+L+1>seqcap){while(seqlen+L+1>seqcap)seqcap*=2;seq=realloc(seq,seqcap);}
+            for(size_t z=0;z<L;z++) seq[seqlen++]=toupper((unsigned char)line[z]); }
+    }
+    if(!stop && in_seq) PIPE_PROCESS();
+    fclose(fp);
+    double t1=L1_WTIME();
+    /* free the shard's admission scratch; hand back only the promoted set + tallies */
+    free(cms.t); free(seq); free(hdr); free(kbuf); free(sk); free(line);
+    S->ps=ps; S->n_mine=n_mine; S->n_admit=n_admit; S->n_reject=n_reject;
+    S->n_skip=n_skip; S->n_lowqual=n_lowqual; S->dt=t1-t0;
+}
+
+/* emit re-scan for one shard byte range -> PREFIX.rank<idx>.fasta (same filename shape as MPI). */
+static void emit_shard(const char*input, off_t ms, off_t me, int idx,
+                       const char*emit, const char*promoted_hdrs, int n_promoted){
+    char outpath[4096]; snprintf(outpath,sizeof outpath,"%s.rank%d.fasta",emit,idx);
+    FILE*of=fopen(outpath,"w");
+    FILE*fp2=fopen(input,"rb"); fseeko(fp2,ms,SEEK_SET);
+    char*ln=NULL; size_t lcp=0; ssize_t l2; long ehoff; size_t seqcap=1<<20;
+    char curh[HW]={0}; uint8_t*ebuf=malloc(seqcap); size_t ebl=0; int have=0;
+    while((l2=getline(&ln,&lcp,fp2))>=0){
+        if(ln[0]=='>'){ ehoff=ftello(fp2)-l2; FLUSH_EMIT();
+            if(ehoff>=me){have=0;break;}
+            size_t L=l2; while(L>0&&(ln[L-1]=='\n'||ln[L-1]=='\r'))L--;
+            strncpy(curh,ln+1,L-1<HW-1?L-1:HW-1); curh[(L-1<HW-1?L-1:HW-1)]=0;
+            ebl=0; have=1;
+        } else { size_t L=l2; while(L>0&&(ln[L-1]=='\n'||ln[L-1]=='\r'))L--;
+            if(ebl+L+1>seqcap){while(ebl+L+1>seqcap)seqcap*=2;ebuf=realloc(ebuf,seqcap);}
+            for(size_t z=0;z<L;z++) ebuf[ebl++]=toupper((unsigned char)ln[z]); }
+    }
+    if(have) FLUSH_EMIT();
+    fclose(fp2); fclose(of); free(ebuf); free(ln);
+}
+#endif /* !USE_MPI */
+
+#if defined(USE_THREADS)
+static void*shard_thread(void*a){ run_shard((shard_t*)a); return NULL; }
+typedef struct { const char*input; off_t ms,me; int idx; const char*emit;
+                 const char*promoted_hdrs; int n_promoted; } emit_arg_t;
+static void*emit_thread(void*a){ emit_arg_t*e=(emit_arg_t*)a;
+    emit_shard(e->input,e->ms,e->me,e->idx,e->emit,e->promoted_hdrs,e->n_promoted); return NULL; }
+#endif
+
 int main(int argc,char**argv){
+#ifdef USE_MPI
     MPI_Init(&argc,&argv);
     int rank,nproc; MPI_Comm_rank(MPI_COMM_WORLD,&rank); MPI_Comm_size(MPI_COMM_WORLD,&nproc);
+#else
+    /* rank is a per-shard concept; the single process is always "rank 0" so every existing
+     * `if(rank==0)` print guard Just Works. nproc is the *process* count (1); the *shard*
+     * count for THREADS is the separate `nthreads` variable. */
+    int rank=0,nproc=1;
+#endif
     init_lut();
     const char*input=NULL,*emit=NULL; int k=DEF_K,m=DEF_M,warmup=DEF_WARMUP; long limit=0;
     long min_len=27000; double max_n_frac=0.05;   /* completeness gate (§2.22): drop partial/gappy */
     double err_rate=DEF_ERR_RATE,pcut=DEF_P,outlier_sd=DEF_OUTLIER_SD,threshold=DEF_THRESHOLD;
+    int nthreads=1;
+#if defined(USE_THREADS)
+    nthreads=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthreads<1)nthreads=1;   /* default = online CPUs */
+#endif
     for(int a=1;a<argc;a++){
         if(!strcmp(argv[a],"--input"))input=argv[++a];
         else if(!strcmp(argv[a],"--emit-promoted"))emit=argv[++a];
@@ -170,19 +343,35 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[a],"--limit"))limit=atol(argv[++a]);
         else if(!strcmp(argv[a],"--min-len"))min_len=atol(argv[++a]);
         else if(!strcmp(argv[a],"--max-n-frac"))max_n_frac=atof(argv[++a]);
+        else if(!strcmp(argv[a],"--threads"))nthreads=atoi(argv[++a]);   /* threads backend only */
     }
-    if(!input){if(rank==0)fprintf(stderr,"--input required\n");MPI_Finalize();return 1;}
+    if(!input){if(rank==0)fprintf(stderr,"--input required\n");L1_FINALIZE();return 1;}
+#ifndef USE_THREADS
+    (void)nthreads;   /* parsed unconditionally so --threads is accepted/ignored in MPI/serial */
+#endif
     int B=LSH_BANDS,R=m/B;
     uint64_t*salts=malloc(m*sizeof(uint64_t)); uint64_t s=0x123456789ABCDEFULL;
     for(int i=0;i<m;i++){s^=s<<13;s^=s>>7;s^=s<<17;salts[i]=s|1ULL;}
 
+    /* ---- shard-local promoted sets are gathered into these flat buffers for the phase-2 merge;
+     * tallies are reduced into the g_* accumulators. Filled per-backend below. ---- */
+    int shards=nproc;                 /* what the banner reports as the parallel width */
+    int total=0; uint64_t*allsk=NULL; char*allhdr=NULL;
+    long g_mine=0,g_admit=0,g_reject=0,g_skip=0,g_lowqual=0; double maxdt=0;
+#ifndef USE_THREADS
+    off_t ms=0,me=0;                  /* this process's byte range (MPI/serial), reused for emit.
+                                       * THREADS uses each thread's saved sh[t].ms/me instead. */
+#endif
+
+#ifdef USE_MPI
+    /* ================= MPI BACKEND (unchanged behavior) ================= */
     cms_t cms; cms_init(&cms);
     pset_t ps; pset_init(&ps,m,20);
 
     /* byte-range shard */
     FILE*fp=fopen(input,"rb"); if(!fp){if(rank==0)fprintf(stderr,"open fail\n");MPI_Abort(MPI_COMM_WORLD,1);}
     fseeko(fp,0,SEEK_END); off_t fsize=ftello(fp);
-    off_t slice=fsize/nproc, ms=(off_t)rank*slice, me=(rank==nproc-1)?fsize:(off_t)(rank+1)*slice;
+    off_t slice=fsize/nproc; ms=(off_t)rank*slice; me=(rank==nproc-1)?fsize:(off_t)(rank+1)*slice;
     if(rank>0){ fseeko(fp,ms,SEEK_SET); int c; while((c=fgetc(fp))!=EOF&&c!='\n');
         while(1){long here=ftello(fp);c=fgetc(fp);if(c==EOF){ms=here;break;}if(c=='>'){ms=here;break;}while((c=fgetc(fp))!=EOF&&c!='\n');} }
     else ms=0;
@@ -194,28 +383,6 @@ int main(int argc,char**argv){
     size_t seqlen=0; int in_seq=0; char*line=NULL; size_t lc=0; ssize_t ll;
     long n_mine=0,n_admit=0,n_reject=0,n_skip=0,n_lowqual=0; double sc_sum=0,sc_sqsum=0; long sc_n=0;
     double t0=MPI_Wtime(); int stop=0;
-
-    #define PIPE_PROCESS() do{ if(in_seq){ n_mine++; \
-        /* COMPLETENESS GATE (§2.22): drop partial/gappy genomes BEFORE novelty can promote them for \
-         * being k-mer-sparse. Cheap length + N-fraction check, before k-mer extraction. */ \
-        if((long)seqlen<min_len || n_fraction(seq,seqlen)>max_n_frac){ n_lowqual++; } else { \
-        size_t nu=genome_kmers(seq,seqlen,k,kbuf,kcap); \
-        if(nu==0){ n_skip++; } else { \
-            /* ADMISSION */ \
-            long n_singleton=0; for(size_t z=0;z<nu;z++){uint32_t d=cms_query(&cms,kbuf[z]);if(d==0)n_singleton++;} \
-            int reject=0; \
-            if(sc_n>=warmup && n_mine>warmup){ double mean=sc_sum/sc_n,var=sc_sqsum/sc_n-mean*mean; if(var<0)var=0; \
-                if((double)n_singleton>mean+outlier_sd*sqrt(var)+0.5) reject=1; } \
-            sc_sum+=n_singleton; sc_sqsum+=(double)n_singleton*n_singleton; sc_n++; \
-            if(reject){ n_reject++; } else { n_admit++; \
-                for(size_t z=0;z<nu;z++) cms_inc(&cms,kbuf[z]); \
-                /* NOVELTY on admitted only, reusing the SAME k-mers. Date-partitioned: \
-                 * novelty judged within the sample's month bucket. */ \
-                minhash_from_kmers(kbuf,nu,m,salts,sk); \
-                int mb=month_bucket(hdr); \
-                if(is_novel(&ps,mb,sk,threshold,R,B)) pset_add(&ps,mb,sk,R,B,hdr); \
-            } } } \
-        if(limit && n_mine>=limit) stop=1; } }while(0)
 
     while((ll=getline(&line,&lc,fp))>=0){
         if(line[0]=='>'){ long hoff=ftello(fp)-ll; PIPE_PROCESS(); if(stop)break;
@@ -235,11 +402,10 @@ int main(int argc,char**argv){
      * Headers gathered as fixed-width (HW) buffers so MPI_Gatherv works on plain bytes.
      * Sequences are NOT moved (they'd be huge); instead rank0 broadcasts the SURVIVING
      * header set and each rank RE-EMITS its own promoted genomes by re-scanning its shard. */
-    #define HW 256
     int local_p=ps.n; int*counts=NULL;
     if(rank==0) counts=malloc(nproc*sizeof(int));
     MPI_Gather(&local_p,1,MPI_INT,counts,1,MPI_INT,0,MPI_COMM_WORLD);
-    int total=0; int*rc=NULL,*rd=NULL,*hc=NULL,*hd=NULL; uint64_t*allsk=NULL; char*allhdr=NULL;
+    int*rc=NULL,*rd=NULL,*hc=NULL,*hd=NULL;
     if(rank==0){ rc=malloc(nproc*sizeof(int)); rd=malloc(nproc*sizeof(int));
         hc=malloc(nproc*sizeof(int)); hd=malloc(nproc*sizeof(int)); int off=0,hoff=0;
         for(int i=0;i<nproc;i++){rc[i]=counts[i]*m;rd[i]=off;off+=rc[i];
@@ -251,17 +417,74 @@ int main(int argc,char**argv){
     MPI_Gatherv(ps.sk,local_p*m,MPI_UINT64_T,allsk,rc,rd,MPI_UINT64_T,0,MPI_COMM_WORLD);
     MPI_Gatherv(myhdr,local_p*HW,MPI_CHAR,allhdr,hc,hd,MPI_CHAR,0,MPI_COMM_WORLD);
 
-    long g_mine=0,g_admit=0,g_reject=0,g_skip=0,g_lowqual=0;
     MPI_Reduce(&n_mine,&g_mine,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
     MPI_Reduce(&n_admit,&g_admit,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
     MPI_Reduce(&n_reject,&g_reject,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
     MPI_Reduce(&n_skip,&g_skip,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
     MPI_Reduce(&n_lowqual,&g_lowqual,1,MPI_LONG,MPI_SUM,0,MPI_COMM_WORLD);
-    double dt=t1-t0,maxdt; MPI_Reduce(&dt,&maxdt,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    double dt=t1-t0; MPI_Reduce(&dt,&maxdt,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
 
-    /* rank0 merges; builds the SURVIVING header list, broadcast to all ranks for re-emit */
-    int n_promoted=0; char*promoted_hdrs=NULL;   /* n_promoted*HW, on all ranks after bcast */
+#elif defined(USE_THREADS)
+    /* ================= THREADS BACKEND ================= */
+    /* One process, N pthreads, each OWNING a byte range + a private cms_t + private pset_t +
+     * private warmup stats. This reproduces MPI-with-N-ranks admission bit-for-bit, then runs
+     * the SAME greedy month-partitioned merge that rank0 does. NO shared CMS, NO atomics. */
+    shards=nthreads;
+    FILE*fp0=fopen(input,"rb"); if(!fp0){fprintf(stderr,"open fail\n");L1_ABORT();}
+    fseeko(fp0,0,SEEK_END); off_t fsize=ftello(fp0); fclose(fp0);
+    shard_t*sh=calloc(nthreads,sizeof(shard_t)); pthread_t*th=malloc(nthreads*sizeof(pthread_t));
+    for(int t=0;t<nthreads;t++){ shard_t*S=&sh[t];
+        S->input=input; S->fsize=fsize; S->tid=t; S->nshard=nthreads;
+        S->k=k; S->m=m; S->B=B; S->R=R; S->warmup=warmup; S->limit=limit; S->min_len=min_len;
+        S->err_rate=err_rate; S->pcut=pcut; S->outlier_sd=outlier_sd; S->max_n_frac=max_n_frac;
+        S->threshold=threshold; S->salts=salts;
+        pthread_create(&th[t],NULL,shard_thread,S); }
+    for(int t=0;t<nthreads;t++) pthread_join(th[t],NULL);
+    /* concatenate per-thread promoted sets into the gather buffers in ASCENDING tid order,
+     * exactly matching MPI's Gatherv rank ordering, so the greedy merge visits candidates in
+     * the same deterministic order (which of two tie-distant same-month candidates wins). */
+    for(int t=0;t<nthreads;t++) total+=sh[t].ps.n;
+    allsk=malloc((size_t)total*m*sizeof(uint64_t)); allhdr=calloc((size_t)total*HW,1);
+    int woff=0;
+    for(int t=0;t<nthreads;t++){ pset_t*P=&sh[t].ps;
+        for(int i=0;i<P->n;i++){ memcpy(&allsk[(size_t)woff*m],&P->sk[(size_t)i*m],m*sizeof(uint64_t));
+            if(P->hdrs[i]) strncpy(&allhdr[(size_t)woff*HW],P->hdrs[i],HW-1); woff++; } }
+    /* only the scalar tallies are reduced across shards -- the CMS is never merged (per-shard
+     * running oracle) and warmup stats stay per-thread. */
+    for(int t=0;t<nthreads;t++){ g_mine+=sh[t].n_mine; g_admit+=sh[t].n_admit; g_reject+=sh[t].n_reject;
+        g_skip+=sh[t].n_skip; g_lowqual+=sh[t].n_lowqual; if(sh[t].dt>maxdt)maxdt=sh[t].dt; }
+
+#else
+    /* ================= SERIAL BACKEND (drift-free reference oracle) ================= */
+    /* One shard = the whole file, in genome order: a single monotonic warmup ramp and a single
+     * CMS that every admitted genome contributes to. Phase-2 is a genuine NO-OP (below): the
+     * streaming pset already IS the global, month-partitioned promoted set. */
+    shards=1;
+    FILE*fp0=fopen(input,"rb"); if(!fp0){fprintf(stderr,"open fail\n");L1_ABORT();}
+    fseeko(fp0,0,SEEK_END); off_t fsize=ftello(fp0); fclose(fp0);
+    shard_t S; memset(&S,0,sizeof S);
+    S.input=input; S.fsize=fsize; S.tid=0; S.nshard=1;
+    S.k=k; S.m=m; S.B=B; S.R=R; S.warmup=warmup; S.limit=limit; S.min_len=min_len;
+    S.err_rate=err_rate; S.pcut=pcut; S.outlier_sd=outlier_sd; S.max_n_frac=max_n_frac;
+    S.threshold=threshold; S.salts=salts;
+    run_shard(&S);
+    pset_t ps=S.ps; ms=S.ms; me=S.me;
+    total=ps.n;
+    /* build the flat gather buffers from the single pset (so emit/free share one code path);
+     * NO cross-shard merge is performed for serial => zero margin drift. */
+    allsk=malloc((size_t)total*m*sizeof(uint64_t)); allhdr=calloc((size_t)total*HW,1);
+    for(int i=0;i<total;i++){ memcpy(&allsk[(size_t)i*m],&ps.sk[(size_t)i*m],m*sizeof(uint64_t));
+        if(ps.hdrs[i]) strncpy(&allhdr[(size_t)i*HW],ps.hdrs[i],HW-1); }
+    g_mine=S.n_mine; g_admit=S.n_admit; g_reject=S.n_reject; g_skip=S.n_skip; g_lowqual=S.n_lowqual;
+    maxdt=S.dt;
+#endif
+
+    /* ---- PHASE 2 merge + report (rank0 only; rank==0 always true for serial/threads) ---- */
+    int n_promoted=0; char*promoted_hdrs=NULL;   /* n_promoted*HW; on all ranks after bcast (MPI) */
     if(rank==0){
+#if defined(USE_MPI) || defined(USE_THREADS)
+        /* greedy cross-shard merge -> global promoted set. Identical function calls in MPI and
+         * THREADS, so given the same shard partition they produce the same global set. */
         pset_t merged; pset_init(&merged,m,20);
         promoted_hdrs=malloc((size_t)total*HW);   /* upper bound */
         for(int i=0;i<total;i++){ uint64_t*msk=&allsk[(size_t)i*m];
@@ -270,8 +493,14 @@ int main(int argc,char**argv){
             int mb=month_bucket(&allhdr[(size_t)i*HW]);
             if(is_novel(&merged,mb,msk,threshold,R,B)){ pset_add(&merged,mb,msk,R,B,NULL);
                 memcpy(&promoted_hdrs[(size_t)n_promoted*HW],&allhdr[(size_t)i*HW],HW); n_promoted++; } }
+#else
+        /* SERIAL phase-2 NO-OP: the streaming pset already applied month-partitioned novelty,
+         * so it IS the global promoted set. Do NOT re-run the merge (would double-apply). */
+        n_promoted=total; promoted_hdrs=malloc((size_t)total*HW);
+        if(total) memcpy(promoted_hdrs,allhdr,(size_t)total*HW);
+#endif
         printf("\n=== L1 PIPELINE (composed: admission + novelty, one pass) ===\n");
-        printf("input=%s nproc=%d k=%d sketch=%d threshold=%g\n",input,nproc,k,m,threshold);
+        printf("input=%s nproc=%d k=%d sketch=%d threshold=%g\n",input,shards,k,m,threshold);
         printf("seen (input genomes) : %ld\n",g_mine);
         printf("  LOW-QUAL (partial) : %ld  (%.3f%%)  [completeness gate: <%ld nt or >%.0f%% N]\n",
                g_lowqual,100.0*g_lowqual/(g_mine>0?g_mine:1),min_len,100*max_n_frac);
@@ -281,15 +510,23 @@ int main(int argc,char**argv){
         printf("PROMOTED to L2       : %d  (%.4f%% of input, %.4f%% of admitted)\n",
                n_promoted,100.0*n_promoted/(g_mine>0?g_mine:1),100.0*n_promoted/(g_admit>0?g_admit:1));
         printf("overall rejection    : %.1fx (input/promoted)\n",(double)g_mine/(n_promoted>0?n_promoted:1));
-        printf("throughput           : %.0f seq/s (aggregate, %d ranks)  wall %.1fs\n",g_mine/(maxdt>0?maxdt:1),nproc,maxdt);
+        printf("throughput           : %.0f seq/s (aggregate, %d shards)  wall %.1fs\n",g_mine/(maxdt>0?maxdt:1),shards,maxdt);
     }
 
-    /* free the big per-rank structures before the emit re-scan — CMS/pset no longer needed;
+    /* free the big per-shard structures before the emit re-scan — CMS/pset no longer needed;
      * halves peak memory during emit (matters at scale — this class of over-allocation OOM'd nodes). */
+#ifdef USE_MPI
     free(cms.t); cms.t=NULL;
     free(ps.sk); free(kbuf); free(sk);
+#elif defined(USE_THREADS)
+    for(int t=0;t<nthreads;t++) free(sh[t].ps.sk);
+    free(allsk); free(allhdr);
+#else
+    free(ps.sk); free(allsk); free(allhdr);
+#endif
 
-    /* ---- EMIT: broadcast surviving headers, each rank re-scans its shard + writes owned promoted genomes ---- */
+    /* ---- EMIT: re-scan each shard's byte range + write owned promoted genomes ---- */
+#ifdef USE_MPI
     if(emit){
         MPI_Bcast(&n_promoted,1,MPI_INT,0,MPI_COMM_WORLD);
         if(rank!=0) promoted_hdrs=malloc((size_t)n_promoted*HW);
@@ -302,9 +539,6 @@ int main(int argc,char**argv){
         FILE*fp2=fopen(input,"rb"); fseeko(fp2,ms,SEEK_SET);
         char*ln=NULL; size_t lcp=0; ssize_t l2; int emit_seq=0; long ehoff;
         char curh[HW]={0}; uint8_t*ebuf=malloc(seqcap); size_t ebl=0; int have=0;
-        #define FLUSH_EMIT() do{ if(have){ char key[HW]; strncpy(key,curh,HW-1); key[HW-1]=0; \
-            if(bsearch(key,promoted_hdrs,n_promoted,HW,(int(*)(const void*,const void*))strcmp)){ \
-                fprintf(of,">%s\n",curh); fwrite(ebuf,1,ebl,of); fputc('\n',of); } } }while(0)
         while((l2=getline(&ln,&lcp,fp2))>=0){
             if(ln[0]=='>'){ ehoff=ftello(fp2)-l2; FLUSH_EMIT();
                 if(ehoff>=me){have=0;break;}
@@ -317,9 +551,37 @@ int main(int argc,char**argv){
         }
         if(have) FLUSH_EMIT();
         fclose(fp2); fclose(of); free(ebuf); free(ln);
+        (void)emit_seq;
         MPI_Barrier(MPI_COMM_WORLD);
         if(rank==0) fprintf(stderr,"[emit] promoted genomes written to %s.rank*.fasta (concat for L2 input)\n",emit);
     }
-    MPI_Finalize();
+#elif defined(USE_THREADS)
+    if(emit){
+        /* sort the shared promoted set ONCE; emit threads only bsearch it (read-only => lock-free).
+         * Per-thread PREFIX.rank<tid>.fasta files: same filename shape as MPI, no write mutex,
+         * and each thread reuses its SAVED (ms,me) so emit uses the exact processing partition. */
+        qsort(promoted_hdrs,n_promoted,HW,(int(*)(const void*,const void*))strcmp);
+        pthread_t*eth=malloc(nthreads*sizeof(pthread_t)); emit_arg_t*ea=malloc(nthreads*sizeof(emit_arg_t));
+        for(int t=0;t<nthreads;t++){ ea[t].input=input; ea[t].ms=sh[t].ms; ea[t].me=sh[t].me;
+            ea[t].idx=t; ea[t].emit=emit; ea[t].promoted_hdrs=promoted_hdrs; ea[t].n_promoted=n_promoted;
+            pthread_create(&eth[t],NULL,emit_thread,&ea[t]); }
+        for(int t=0;t<nthreads;t++) pthread_join(eth[t],NULL);   /* join == barrier */
+        free(eth); free(ea);
+        fprintf(stderr,"[emit] promoted genomes written to %s.rank*.fasta (concat for L2 input)\n",emit);
+    }
+    free(sh); free(th);
+    free(promoted_hdrs);
+#else
+    if(emit){
+        qsort(promoted_hdrs,n_promoted,HW,(int(*)(const void*,const void*))strcmp);
+        /* one shard = the whole file; PREFIX.rank0.fasta matches the MPI single-rank convention
+         * so downstream `cat PREFIX.rank*.fasta` concat scripts keep working. */
+        emit_shard(input,ms,me,0,emit,promoted_hdrs,n_promoted);
+        fprintf(stderr,"[emit] promoted genomes written to %s.rank0.fasta (concat for L2 input)\n",emit);
+    }
+    free(promoted_hdrs);
+#endif
+
+    L1_FINALIZE();
     return 0;
 }
