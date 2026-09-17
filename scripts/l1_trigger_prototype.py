@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-L1 TRIGGER PROTOTYPE (SARS-CoV-2 DAQ) -- alignment-free streaming novelty gate.
+L1 TRIGGER PROTOTYPE -- alignment-free streaming novelty gate (reference oracle).
 
 Detector-physics framing: this is the "L1 trigger" that runs at ingest rate and
 decides, per genome, PROMOTE (novel enough -> goes to L2 reconstruction) vs DROP
