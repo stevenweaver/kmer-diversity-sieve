@@ -1,5 +1,5 @@
 /*
- * l1_novelty.c -- L1 novelty gate (C + OpenMPI), stage 2 of the DAQ trigger.
+ * l1_novelty.c -- novelty gate (C + OpenMPI), stage 2 of the k-mer sieve.
  *
  * Follows the admission filter (l1_trigger.c). Answers "is this admitted genome NEW
  * enough to send to L2?" via MinHash sketch-distance to the already-promoted set.

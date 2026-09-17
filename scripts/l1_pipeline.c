@@ -1,5 +1,5 @@
 /*
- * l1_pipeline.c -- COMPOSED L1 DAQ trigger (C): admission + novelty, ONE pass.
+ * l1_pipeline.c -- composed k-mer sieve (C): admission + novelty, ONE pass.
  *
  * Fuses the two validated stages (l1_trigger.c admission, l1_novelty.c novelty) into a
  * single streaming pass. Efficiency: k-mers are extracted ONCE per genome and reused for
