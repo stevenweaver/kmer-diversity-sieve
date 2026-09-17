@@ -37,9 +37,14 @@ l1_pipeline_threads
 l1_novelty
 l1_trigger
 l1_pipeline_datehash
+unit_test
 *.o
 *.out
 *.exe
+
+# test artifacts
+tests/fixture.fasta
+tests/*.rank*.fasta
 
 # Bulky reference downloads
 *.gz

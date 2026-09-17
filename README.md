@@ -76,6 +76,7 @@ make serial    # cc -O3, no MPI, no threads     -> l1_pipeline_serial
 make threads   # cc -pthread (NO OpenMP)         -> l1_pipeline_threads
 make mpi       # mpicc -DUSE_MPI                 -> l1_pipeline
 make all       # build all three
+make test      # unit tests + end-to-end / backend-invariant tests
 ```
 
 Then run whichever you built:
@@ -260,6 +261,13 @@ The promoted set was cross-checked against a public UShER global tree.
   validation / profiling helpers.
 - `scripts/bench_scaling.sbatch`, `scripts/bench_novelty_scaling.sbatch` —
   SLURM scaling benchmarks.
+- `tests/unit_test.c` — C unit tests for the pure primitives (k-mer
+  canonicalization, Count-Min, MinHash/Jaccard, month-bucket parsing,
+  completeness gate). `make unit`.
+- `tests/e2e.sh`, `tests/gen_fixture.py` — end-to-end tests over a deterministic
+  synthetic fixture: every backend runs, the filter fires, serial is
+  reproducible, and **threads == mpi bit-for-bit**. `make e2e` (the MPI lane is
+  auto-skipped if no MPI toolchain is present).
 
 ## Licensing / data
 

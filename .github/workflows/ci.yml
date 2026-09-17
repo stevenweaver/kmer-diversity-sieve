@@ -7,6 +7,22 @@ on:
     branches: [main]
 
 jobs:
+  # Full runnable test suite: C unit tests for the primitives + end-to-end
+  # backend-invariant tests (incl. threads==mpi bit-for-bit). Locally: `make test`.
+  test-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install MPI toolchain
+        # so the e2e threads==mpi invariant is actually exercised (not skipped)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
+      - name: Unit tests
+        run: make unit
+      - name: End-to-end + invariant tests
+        run: make e2e
+
   build-and-smoke:
     runs-on: ubuntu-latest
     strategy:
