@@ -23,6 +23,26 @@ jobs:
       - name: End-to-end + invariant tests
         run: make e2e
 
+  # macOS lane: proves the DEPENDENCY-FREE backends (serial, threads) build with
+  # stock Apple clang and pass the suite. This is the whole reason the threads
+  # backend uses pthreads, not OpenMP -- Apple clang ships no libomp. macos-latest
+  # is Apple Silicon (arm64), so this also exercises the Makefile's -mcpu=native
+  # path. No MPI on GitHub's macOS runners, so the e2e MPI lane auto-skips.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Show toolchain
+        run: cc --version && uname -m
+      - name: Build serial + threads (stock clang, no deps)
+        run: |
+          make serial
+          make threads
+      - name: Unit tests
+        run: make unit
+      - name: End-to-end + invariant tests (MPI lane auto-skips)
+        run: make e2e
+
   build-and-smoke:
     runs-on: ubuntu-latest
     strategy:
