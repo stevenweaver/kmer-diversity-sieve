@@ -150,6 +150,62 @@ which byte-range of the input and how the per-shard promoted sets are merged.*
 The `27000` / `0.05` defaults are sized for coronavirus-length genomes —
 **override `--min-len` and `--max-n-frac` for any other organism.**
 
+## Calibrating `--threshold` and `--sketch`
+
+The two novelty knobs are coupled: `--threshold` sets *where* the divergence
+boundary is, and `--sketch` sets *how finely* the estimator can see. Getting one
+right without the other leaves the sieve mis-aimed, so it's worth understanding
+both before trusting the defaults on a new dataset.
+
+**`--threshold` (τ) → the divergence boundary.** A record is promoted only when
+`1 − Jaccard ≥ τ` against every already-promoted record. Because the Jaccard is
+over *k*-mer sets, τ maps to an approximate nucleotide-divergence boundary:
+
+```
+d  ≈  τ / (2·k)
+```
+
+At the default `k = 15`, `τ = 0.15` targets `d ≈ 0.5%` divergence — deliberately
+coarse, because the tool was built to collapse **archive-scale** near-duplicates
+(e.g. millions of SARS-CoV-2 consensus genomes within ~0.5% of each other). For a
+**gene-scale** cohort of one organism, where the interesting lineages differ by
+far less, that boundary is too high and everything collapses to ~1 representative.
+Lower τ to aim at your cohort: `τ = 0.005` targets `d ≈ 0.017%`.
+
+**`--sketch` (m) → the resolution floor.** Similarity is estimated as *matching
+slots out of m*, so it comes in steps of `1/m`. Two records whose true novelty is
+below `1/m` are reported as identical **no matter how low τ is** — you've aimed
+below what the fingerprint can resolve. So lowering τ past the floor does nothing;
+you must also raise m:
+
+| `--sketch` (m) | resolution floor (`1/m`) | ~divergence floor |
+|---|---|---|
+| 64 (default) | ~1.6% | ~0.05% |
+| 128 | ~0.8% | ~0.025% |
+| 256 | ~0.4% | ~0.015% |
+
+Bigger m = finer discrimination, at `m × 8 B` per stored record plus a little more
+compute per comparison. That cost is negligible at gene scale but is why the
+default is a lean 64 for archive scale. (m is also split into `16` LSH bands of
+`m/16` rows, so raising m also changes *which* records become comparison
+candidates, not just the precision of each comparison.)
+
+**Rule of thumb.** Size τ to your cohort's *median pairwise divergence* `d`
+via `τ ≈ 2·k·d`, then pick m so that `1/m < d` (i.e. the floor sits below the
+boundary). A quick way to estimate `d` before committing:
+
+```sh
+mash dist -k 15 -s 1000 recon.fasta recon.fasta | awk '{print $3}' | sort -n
+# take the median; if it's below ~0.5%, the sieve can help — otherwise it's
+# either a no-op (cohort too diverse for LSH to consolidate) or a signal-losing
+# collapse, and you're better off skipping it.
+```
+
+*(This calibration was worked out in the [`disassembler`](https://github.com/nekrut/disassembler)
+integration — see its `docs/issue_sieve_calibration.md` for cross-gene topology
+measurements. Its `disassemble.py` wrapper defaults to `τ = 0.005`, `m = 256` for
+gene-scale cohorts, versus this tool's archive-scale `τ = 0.15`, `m = 64`.)*
+
 ## Running on a single node — read this first
 
 **On a single node, prefer the `threads` backend over `mpirun` on localhost.**
